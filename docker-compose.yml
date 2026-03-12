@@ -1,0 +1,13 @@
+services:
+  samurai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: samurai_dev
+    runtime: nvidia
+    environment: 
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    ipc: host         # Share IPC namespace (for performance)
+    ulimits:
+      memlock: -1      # Disable memory locking limits
+      stack: 67108864  # Increase stack size to 64MB
