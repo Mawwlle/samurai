@@ -31,7 +31,6 @@ python-dotenv==1.2.2
 python-multipart==0.0.22
 PyYAML==6.0.3
 requests==2.32.5
--e git+ssh://git@github.com/Mawwlle/samurai.git@900b865c980108b6483afd900d814ec138d2c7f7#egg=SAM_2&subdirectory=sam2
 scipy==1.17.1
 setuptools==82.0.1
 starlette==0.52.1
