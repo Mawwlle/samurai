@@ -11,7 +11,8 @@ class VideoDTO(BaseModel):
         filename: Original uploaded filename.
         width: Frame width in pixels.
         height: Frame height in pixels.
-        duration_sec: Video duration in seconds.
+        duration_sec: Video duration in seconds; ``None`` for frame sequences.
+        frame_count: Number of frames; ``None`` for MP4 uploads.
         url: Relative URL to stream the video.
         poster_url: Relative URL to fetch the first-frame poster image.
     """
@@ -20,7 +21,8 @@ class VideoDTO(BaseModel):
     filename: str
     width: int
     height: int
-    duration_sec: float
+    duration_sec: float | None
+    frame_count: int | None
     url: str
     poster_url: str
 

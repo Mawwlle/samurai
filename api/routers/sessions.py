@@ -3,10 +3,13 @@
 import asyncio
 import json
 import logging
+import shutil
+import subprocess
 import uuid
 from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -37,6 +40,22 @@ from api.schemas.tracking import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["Sessions"])
+
+
+def _extract_frames(video_path: Path, frames_dir: Path, ffmpeg_threads: int) -> None:
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-threads", str(ffmpeg_threads),
+        "-q:v", "2",
+        str(frames_dir / "%05d.jpg"),
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"ffmpeg frame extraction failed for '{video_path.name}': {exc.stderr.decode().strip()}"
+        ) from exc
 
 _propagation_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="propagation")
 
@@ -140,12 +159,18 @@ async def create_session(
 
     video = video_repo.get(body.video_id)
 
+    frames_dir = Path(video.frames_path)
+    if not frames_dir.exists():
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(_extract_frames, Path(video.video_path), frames_dir, settings.ffmpeg_threads)
+        logger.info("Extracted frames for video %s to %s", body.video_id, frames_dir)
+
     offload = predictor.device.type == "mps"
 
     def _init() -> inference.InferenceState:
         ctx = autocast_context(predictor.device)
         with ctx:
-            return inference.init_state(predictor, video.video_path, offload_video_to_cpu=offload)
+            return inference.init_state(predictor, str(frames_dir), offload_video_to_cpu=offload)
 
     state = await asyncio.to_thread(_init)
 
@@ -176,10 +201,23 @@ def close_session(
     session_id: str,
     predictor: SAM2VideoPredictor = Depends(get_predictor),
     session_repo: SessionRepository = Depends(get_session_repo),
+    video_repo: VideoRepository = Depends(get_video_repo),
 ) -> CloseSessionResponse:
-    """Close a session and release its GPU resources."""
+    """Close a session, release GPU resources, and delete associated video files."""
+
+    session = session_repo.get(session_id)
+    video_id = session.video_id
 
     success = session_repo.remove(session_id, predictor)
+
+    if success:
+        try:
+            video = video_repo.get(video_id)
+            upload_dir = Path(video.video_path).parent
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            video_repo.remove(video_id)
+        except Exception:
+            pass
 
     logger.info("Session %s closed (found=%s)", session_id, success)
 

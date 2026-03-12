@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from PIL import Image
 
 from api.config import Settings
 from api.dependencies import get_settings, get_video_repo
@@ -33,19 +34,20 @@ def _video_to_dto(record: VideoRecord) -> VideoDTO:
         width=record.width,
         height=record.height,
         duration_sec=record.duration_sec,
+        frame_count=record.frame_count,
         url=f"/videos/{record.id}/stream",
         poster_url=f"/videos/{record.id}/poster",
     )
 
 
-def _probe_video(video_path: Path) -> tuple[int, int, float]:
-    """Extract width, height, and duration from a video file using ffprobe.
+def _probe_video(video_path: Path) -> tuple[int, int, float, int]:
+    """Extract width, height, duration, and frame count from a video file using ffprobe.
 
     Args:
         video_path: Absolute path to the video file.
 
     Returns:
-        Tuple of ``(width, height, duration_sec)``.
+        Tuple of ``(width, height, duration_sec, frame_count)``.
 
     Raises:
         VideoProcessingError: If ffprobe fails or returns unexpected output.
@@ -54,7 +56,7 @@ def _probe_video(video_path: Path) -> tuple[int, int, float]:
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,duration",
+        "-show_entries", "stream=width,height,duration,nb_frames",
         "-of", "csv=p=0",
         str(video_path),
     ]
@@ -75,7 +77,13 @@ def _probe_video(video_path: Path) -> tuple[int, int, float]:
             f"Unexpected ffprobe output for '{video_path.name}': {result.stdout!r}"
         ) from exc
 
-    return width, height, duration
+    try:
+        frame_count = int(parts[3])
+    except (IndexError, ValueError):
+        frame_count = 0
+
+    return width, height, duration, frame_count
+
 
 
 def _extract_poster(video_path: Path, poster_path: Path) -> None:
@@ -165,17 +173,13 @@ async def upload_video(
 ) -> VideoUploadResponse:
     """Accept a video upload, optionally trim it, and store metadata."""
 
-    if file.content_type not in ("video/mp4", "video/quicktime"):
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported media type '{file.content_type}'. Upload an MP4 video.",
-        )
 
     video_id = str(uuid.uuid4())
     upload_dir: Path = settings.data_path / video_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_path = upload_dir / "raw.mp4"
+    suffix = Path(file.filename or "video.mp4").suffix.lower() or ".mp4"
+    raw_path = upload_dir / f"raw{suffix}"
     final_path = upload_dir / "video.mp4"
     poster_path = upload_dir / "poster.jpg"
 
@@ -187,14 +191,15 @@ async def upload_video(
             f"Failed to save uploaded file '{file.filename}': {exc}"
         ) from exc
 
+    needs_convert = suffix != ".mp4"
     needs_trim = start_sec > 0.0 or duration_sec is not None
-    if needs_trim:
+    if needs_trim or needs_convert:
         _trim_video(raw_path, final_path, start_sec, duration_sec, settings.ffmpeg_threads)
         raw_path.unlink()
     else:
         raw_path.rename(final_path)
 
-    width, height, actual_duration = _probe_video(final_path)
+    width, height, actual_duration, frame_count = _probe_video(final_path)
 
     if actual_duration > settings.max_upload_duration_sec:
         shutil.rmtree(upload_dir)
@@ -208,14 +213,149 @@ async def upload_video(
 
     _extract_poster(final_path, poster_path)
 
+    frames_dir = upload_dir / "frames"
+
     record = VideoRecord(
         id=video_id,
         filename=file.filename or "video.mp4",
         video_path=str(final_path),
+        frames_path=str(frames_dir),
         poster_path=str(poster_path),
         width=width,
         height=height,
         duration_sec=actual_duration,
+        frame_count=frame_count,
+    )
+    video_repo.add(record)
+
+    return VideoUploadResponse(video=_video_to_dto(record))
+
+
+_ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+
+def _probe_frames(frames_dir: Path) -> tuple[int, int, int]:
+    """Read width, height, and frame count from a directory of JPEG frames.
+
+    Args:
+        frames_dir: Directory containing zero-padded JPEG files.
+
+    Returns:
+        Tuple of ``(width, height, frame_count)``.
+
+    Raises:
+        VideoProcessingError: If the directory is empty or the first frame is unreadable.
+    """
+
+    frames = sorted(frames_dir.glob("*.jpg"))
+
+    if not frames:
+        raise VideoProcessingError(f"No JPEG frames found in '{frames_dir}'.")
+
+    try:
+        with Image.open(frames[0]) as img:
+            width, height = img.size
+    except OSError as exc:
+        raise VideoProcessingError(
+            f"Cannot read first frame '{frames[0].name}': {exc}"
+        ) from exc
+
+    return width, height, len(frames)
+
+
+def _save_frames(files: list[UploadFile], frames_dir: Path) -> Path:
+    """Save uploaded image files as sorted zero-padded JPEGs.
+
+    Files are sorted by their original filename before saving so that the
+    caller controls ordering by naming convention (e.g. ``frame_001.jpg``).
+
+    Args:
+        files: Uploaded image files.
+        frames_dir: Destination directory (must already exist).
+
+    Returns:
+        Path to the first saved frame (used as the poster).
+
+    Raises:
+        VideoProcessingError: If any file cannot be read or saved.
+    """
+
+    sorted_files = sorted(files, key=lambda f: f.filename or "")
+    first_frame_path: Path | None = None
+
+    for idx, upload in enumerate(sorted_files):
+        dest = frames_dir / f"{idx:05d}.jpg"
+
+        try:
+            with Image.open(upload.file) as img:
+                rgb = img.convert("RGB")
+                rgb.save(dest, format="JPEG", quality=95)
+        except OSError as exc:
+            raise VideoProcessingError(
+                f"Failed to save frame '{upload.filename}': {exc}"
+            ) from exc
+
+        if idx == 0:
+            first_frame_path = dest
+
+    if first_frame_path is None:
+        raise VideoProcessingError("No frames were saved.")
+
+    return first_frame_path
+
+
+@router.post(
+    "/upload-frames",
+    response_model=VideoUploadResponse,
+    status_code=201,
+    summary="Upload a frame sequence",
+    description=(
+        "Upload N image files as an ordered frame sequence for tracking. "
+        "Files are sorted by filename before saving — use zero-padded names "
+        "(e.g. ``frame_000.jpg``, ``frame_001.jpg``) to control order. "
+        "JPEG, PNG, and WebP are accepted."
+    ),
+)
+async def upload_frames(
+    files: list[UploadFile],
+    settings: Settings = Depends(get_settings),
+    video_repo: VideoRepository = Depends(get_video_repo),
+) -> VideoUploadResponse:
+    """Accept a frame sequence upload and store it as a trackable video source."""
+
+    if not files:
+        raise HTTPException(status_code=422, detail="At least one frame is required.")
+
+    for upload in files:
+        if upload.content_type not in _ALLOWED_IMAGE_TYPES:
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    f"Unsupported media type '{upload.content_type}' for file "
+                    f"'{upload.filename}'. Upload JPEG, PNG, or WebP images."
+                ),
+            )
+
+    video_id = str(uuid.uuid4())
+    frames_dir: Path = settings.data_path / video_id / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    poster_path = settings.data_path / video_id / "poster.jpg"
+
+    first_frame = _save_frames(files, frames_dir)
+    width, height, frame_count = _probe_frames(frames_dir)
+
+    shutil.copy(first_frame, poster_path)
+
+    record = VideoRecord(
+        id=video_id,
+        filename=f"{frame_count}_frames",
+        video_path=str(frames_dir),
+        frames_path=str(frames_dir),
+        poster_path=str(poster_path),
+        width=width,
+        height=height,
+        duration_sec=None,
+        frame_count=frame_count,
     )
     video_repo.add(record)
 
@@ -270,6 +410,13 @@ def stream_video(
     """Serve the video file for the requested ID."""
 
     record = video_repo.get(video_id)
+
+    if Path(record.video_path).is_dir():
+        raise HTTPException(
+            status_code=422,
+            detail="This video is a frame sequence and cannot be streamed.",
+        )
+
     return FileResponse(record.video_path, media_type="video/mp4")
 
 

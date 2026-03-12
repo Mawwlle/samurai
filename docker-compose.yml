@@ -3,7 +3,32 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+    platform: linux/amd64
     container_name: samurai
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - samurai_data:/workspace/data
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  samurai-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: samurai-gpu
     env_file:
       - .env
     ports:
@@ -29,6 +54,8 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+    profiles:
+      - gpu
 
 volumes:
   samurai_data:
