@@ -26,6 +26,7 @@ All rights are reserved to the copyright owners (TM & © Universal (2019)). This
 ## News
 - [ ] **Incoming**: Support vot-challenge toolkit intergration.
 - [ ] **Incoming**: Release demo script to support inference on video (with mask prompt).
+- [x] **2026/03/12**: Release production-ready [REST API](#rest-api) with FastAPI, streaming NDJSON propagation, and OpenAPI docs.
 - [x] **2025/02/18**: Release multi-GPU inference script.
 - [x] **2025/01/27**: Release [inference script](https://github.com/yangchris11/samurai/blob/master/sam2/tools/README.md#samurai-vos-inference) on VOS task (SA-V)!
 - [x] **2024/11/21**: Release [demo script](https://github.com/yangchris11/samurai?tab=readme-ov-file#demo-on-custom-video) to support inference on video (bounding box prompt).
@@ -102,6 +103,99 @@ python scripts/demo.py --video_path <your_video.mp4> --txt_path <path_to_first_f
 ```
 # Only JPG images are supported
 python scripts/demo.py --video_path <your_frame_directory> --txt_path <path_to_first_frame_bbox.txt>
+```
+
+## REST API
+
+A production-ready FastAPI is available in the `api/` directory. It exposes the full SAMURAI tracking pipeline over HTTP with streaming results, OpenAPI docs, and Docker support.
+
+### Installation
+
+```bash
+pip install -r api/requirements.txt
+```
+
+### Running
+
+```bash
+# from the project root
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+Interactive docs available at `http://localhost:8000/docs`.
+
+### Configuration
+
+All settings are read from environment variables prefixed with `SAMURAI_`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SAMURAI_MODEL_SIZE` | `base_plus` | Model variant: `tiny`, `small`, `base_plus`, `large` |
+| `SAMURAI_DEVICE` | `cuda` | PyTorch device string |
+| `SAMURAI_DTYPE` | `bfloat16` | Autocast dtype: `float16` or `bfloat16` |
+| `SAMURAI_APP_ROOT` | `sam2` | Path to the `sam2/` directory (must contain `checkpoints/`) |
+| `SAMURAI_DATA_PATH` | `data/uploads` | Directory for uploaded videos and posters |
+| `SAMURAI_MAX_UPLOAD_DURATION_SEC` | `10.0` | Maximum accepted video duration in seconds |
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Server status and GPU memory stats |
+| `POST` | `/videos/upload` | Upload an MP4 video (optional trim via `start_sec` / `duration_sec`) |
+| `GET` | `/videos` | List all uploaded videos |
+| `GET` | `/videos/{id}` | Get video metadata |
+| `GET` | `/videos/{id}/stream` | Stream video file |
+| `GET` | `/videos/{id}/poster` | Fetch first-frame JPEG poster |
+| `POST` | `/sessions` | Create a tracking session (loads video into GPU memory) |
+| `DELETE` | `/sessions/{id}` | Close session and release GPU memory |
+| `POST` | `/sessions/{id}/frames/{n}/points` | Add point prompts on frame `n`; returns updated mask |
+| `POST` | `/sessions/{id}/frames/{n}/box` | Add bounding box prompt on frame `n`; returns updated mask |
+| `DELETE` | `/sessions/{id}/frames/{n}/prompts` | Clear prompts for one object on frame `n` |
+| `DELETE` | `/sessions/{id}/prompts` | Reset all prompts in the session |
+| `DELETE` | `/sessions/{id}/objects/{obj_id}` | Remove a tracked object |
+| `POST` | `/sessions/{id}/propagate` | Stream tracking results as NDJSON |
+| `DELETE` | `/sessions/{id}/propagate` | Cancel an in-progress propagation |
+
+### Typical Workflow
+
+```bash
+# 1. Upload a video
+VIDEO_ID=$(curl -s -X POST http://localhost:8000/videos/upload \
+  -F "file=@clip.mp4" | jq -r '.video.id')
+
+# 2. Create a session
+SESSION_ID=$(curl -s -X POST http://localhost:8000/sessions \
+  -H "Content-Type: application/json" \
+  -d "{\"video_id\": \"$VIDEO_ID\"}" | jq -r '.session_id')
+
+# 3. Add a bounding box prompt on frame 0
+curl -s -X POST http://localhost:8000/sessions/$SESSION_ID/frames/0/box \
+  -H "Content-Type: application/json" \
+  -d '{"object_id": 0, "box": [100, 80, 300, 260]}'
+
+# 4. Stream tracking results (one JSON object per line)
+curl -N http://localhost:8000/sessions/$SESSION_ID/propagate \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"direction": "both"}'
+
+# 5. Close the session
+curl -X DELETE http://localhost:8000/sessions/$SESSION_ID
+```
+
+Each line of the propagation stream is a `TrackingFrameDTO`:
+
+```json
+{
+  "frame_index": 42,
+  "objects": [
+    {
+      "object_id": 0,
+      "mask": {"size": [480, 640], "counts": "..."},
+      "bbox": {"x": 110, "y": 85, "width": 195, "height": 170}
+    }
+  ]
+}
 ```
 
 ## FAQs

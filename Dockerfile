@@ -1,6 +1,6 @@
 FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
 
-ENV PYTHONUNBUFFERED=2
+ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,10 +19,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /workspace
 COPY . .
 
-RUN pip install --upgrade pip setuptools && \
-    pip install -r requirements.txt && \
-    pip install hydra-core iopath decord
+RUN pip install --no-cache-dir --upgrade pip setuptools && \
+    pip install --no-cache-dir -e sam2/ && \
+    pip install --no-cache-dir -r api/requirements.txt
 
 RUN cd sam2/checkpoints && chmod +x download_ckpts.sh && ./download_ckpts.sh
 
-CMD ["/bin/bash"]
+EXPOSE 8000
+
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

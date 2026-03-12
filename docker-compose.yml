@@ -3,11 +3,36 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: samurai_dev
-    runtime: nvidia
-    environment: 
+    container_name: samurai
+    ports:
+      - "8000:8000"
+    environment:
+      - SAMURAI_MODEL_SIZE=base_plus
+      - SAMURAI_DEVICE=cuda
+      - SAMURAI_DTYPE=bfloat16
+      - SAMURAI_APP_ROOT=sam2
+      - SAMURAI_DATA_PATH=data/uploads
+      - SAMURAI_MAX_UPLOAD_DURATION_SEC=10.0
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
-    ipc: host         # Share IPC namespace (for performance)
+    volumes:
+      - samurai_data:/workspace/data
+    ipc: host
     ulimits:
-      memlock: -1      # Disable memory locking limits
-      stack: 67108864  # Increase stack size to 64MB
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  samurai_data:
