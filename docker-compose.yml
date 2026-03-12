@@ -9,8 +9,11 @@ services:
     container_name: samurai
     env_file:
       - .env
+    environment:
+      - SAMURAI_APP_ROOT=/workspace/sam2
+      - SAMURAI_DATA_PATH=/workspace/data/uploads
     ports:
-      - "8000:8000"
+      - "7676:8000"
     volumes:
       - samurai_data:/workspace/data
     ipc: host
@@ -31,10 +34,12 @@ services:
     container_name: samurai-gpu
     env_file:
       - .env
-    ports:
-      - "8000:8000"
     environment:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - SAMURAI_APP_ROOT=/workspace/sam2
+      - SAMURAI_DATA_PATH=/workspace/data/uploads
+    ports:
+      - "7676:8000"
     volumes:
       - samurai_data:/workspace/data
     ipc: host
