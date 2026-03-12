@@ -19,7 +19,7 @@ class Settings(BaseSettings):
         ffmpeg_threads: FFmpeg thread count for video processing.
     """
 
-    model_config = SettingsConfigDict(env_prefix="SAMURAI_")
+    model_config = SettingsConfigDict(env_prefix="SAMURAI_", env_file=".env", env_file_encoding="utf-8")
 
     app_root: Path = Path("sam2")
     model_size: str = "base_plus"

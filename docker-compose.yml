@@ -4,15 +4,11 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: samurai
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     environment:
-      - SAMURAI_MODEL_SIZE=base_plus
-      - SAMURAI_DEVICE=cuda
-      - SAMURAI_DTYPE=bfloat16
-      - SAMURAI_APP_ROOT=sam2
-      - SAMURAI_DATA_PATH=data/uploads
-      - SAMURAI_MAX_UPLOAD_DURATION_SEC=10.0
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
     volumes:
       - samurai_data:/workspace/data
