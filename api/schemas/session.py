@@ -99,3 +99,4 @@ class PropagateRequest(BaseModel):
     start_frame_index: int = Field(default=0, ge=0)
     direction: str = Field(default="both", pattern="^(forward|backward|both)$")
     max_frames: int | None = Field(default=None, gt=0)
+    close_on_complete: bool = Field(default=True)

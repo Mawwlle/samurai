@@ -6,7 +6,7 @@ import logging
 import shutil
 import subprocess
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +83,7 @@ async def _stream_propagation(
     record: SessionRecord,
     request: PropagateRequest,
     score_thresh: float,
+    on_complete: "Callable[[], None] | None" = None,
 ) -> AsyncGenerator[bytes, None]:
     """Stream per-frame tracking results as NDJSON lines.
 
@@ -136,6 +137,9 @@ async def _stream_propagation(
             break
 
         yield (json.dumps(item.model_dump()) + "\n").encode()
+
+    if on_complete is not None:
+        on_complete()
 
 
 @router.post(
@@ -394,6 +398,7 @@ async def propagate(
     body: PropagateRequest,
     predictor: SAM2VideoPredictor = Depends(get_predictor),
     session_repo: SessionRepository = Depends(get_session_repo),
+    video_repo: VideoRepository = Depends(get_video_repo),
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
     """Stream per-frame tracking results as NDJSON."""
@@ -401,12 +406,25 @@ async def propagate(
     record = session_repo.get(session_id)
 
     logger.info(
-        "Starting propagation for session %s: direction=%s start=%d",
-        session_id, body.direction, body.start_frame_index,
+        "Starting propagation for session %s: direction=%s start=%d close_on_complete=%s",
+        session_id, body.direction, body.start_frame_index, body.close_on_complete,
     )
 
+    on_complete: Callable[[], None] | None = None
+    if body.close_on_complete:
+        def on_complete() -> None:
+            video_id = record.video_id
+            session_repo.remove(session_id, predictor)
+            try:
+                video = video_repo.get(video_id)
+                shutil.rmtree(Path(video.video_path).parent, ignore_errors=True)
+                video_repo.remove(video_id)
+            except Exception:
+                pass
+            logger.info("Session %s auto-closed after propagation", session_id)
+
     return StreamingResponse(
-        _stream_propagation(predictor, record, body, settings.score_thresh),
+        _stream_propagation(predictor, record, body, settings.score_thresh, on_complete),
         media_type="application/x-ndjson",
     )
 
