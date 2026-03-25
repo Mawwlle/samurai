@@ -113,24 +113,28 @@ def _extract_poster(video_path: Path, poster_path: Path) -> None:
         ) from exc
 
 
-def _trim_video(
+def _process_video(
     source: Path,
     dest: Path,
     start_sec: float,
     duration_sec: float | None,
+    resize_max_side: int | None,
+    target_fps: float | None,
     ffmpeg_threads: int,
 ) -> None:
-    """Trim a video to the specified time range and re-encode to dest.
+    """Transform a video for tracking and save it to ``dest``.
 
     Args:
         source: Input video path.
         dest: Output video path.
         start_sec: Start offset in seconds.
         duration_sec: Duration to keep; ``None`` means until end of file.
+        resize_max_side: Resize so the longer side is at most this many pixels.
+        target_fps: Re-encode the video to this FPS.
         ffmpeg_threads: Number of threads for ffmpeg.
 
     Raises:
-        VideoProcessingError: If ffmpeg trimming fails.
+        VideoProcessingError: If ffmpeg processing fails.
     """
 
     cmd = [
@@ -138,11 +142,34 @@ def _trim_video(
         "-ss", str(start_sec),
         "-i", str(source),
         "-threads", str(ffmpeg_threads),
-        "-c", "copy",
     ]
 
     if duration_sec is not None:
         cmd += ["-t", str(duration_sec)]
+
+    filters: list[str] = []
+    if resize_max_side is not None:
+        filters.append(
+            "scale='if(gte(iw,ih),min(iw,"
+            f"{resize_max_side}"
+            "),-2)':'if(gte(iw,ih),-2,min(ih,"
+            f"{resize_max_side}"
+            "))'"
+        )
+    if target_fps is not None:
+        filters.append(f"fps={target_fps}")
+
+    if filters:
+        cmd += [
+            "-vf", ",".join(filters),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-c:a", "aac",
+        ]
+    else:
+        cmd += ["-c", "copy"]
 
     cmd.append(str(dest))
 
@@ -150,7 +177,7 @@ def _trim_video(
         subprocess.run(cmd, capture_output=True, check=True)
     except subprocess.CalledProcessError as exc:
         raise VideoProcessingError(
-            f"ffmpeg trim failed for '{source.name}': {exc.stderr.decode().strip()}"
+            f"ffmpeg processing failed for '{source.name}': {exc.stderr.decode().strip()}"
         ) from exc
 
 
@@ -168,6 +195,8 @@ async def upload_video(
     file: UploadFile,
     start_sec: float = Form(default=0.0, ge=0.0),
     duration_sec: float | None = Form(default=None, gt=0.0),
+    resize_max_side: int | None = Form(default=None, ge=64),
+    target_fps: float | None = Form(default=None, gt=0.0),
     settings: Settings = Depends(get_settings),
     video_repo: VideoRepository = Depends(get_video_repo),
 ) -> VideoUploadResponse:
@@ -192,9 +221,23 @@ async def upload_video(
         ) from exc
 
     needs_convert = suffix != ".mp4"
-    needs_trim = start_sec > 0.0 or duration_sec is not None
-    if needs_trim or needs_convert:
-        _trim_video(raw_path, final_path, start_sec, duration_sec, settings.ffmpeg_threads)
+    needs_transform = (
+        needs_convert
+        or start_sec > 0.0
+        or duration_sec is not None
+        or resize_max_side is not None
+        or target_fps is not None
+    )
+    if needs_transform:
+        _process_video(
+            raw_path,
+            final_path,
+            start_sec,
+            duration_sec,
+            resize_max_side,
+            target_fps,
+            settings.ffmpeg_threads,
+        )
         raw_path.unlink()
     else:
         raw_path.rename(final_path)

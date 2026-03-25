@@ -193,6 +193,16 @@ canvas {
           <input type="number" id="dur-sec" min="0.1" step="0.5" placeholder="full">
         </div>
       </div>
+      <div class="fields">
+        <div class="field">
+          <label>Max side (px)</label>
+          <input type="number" id="resize-max-side" min="64" step="32" placeholder="orig">
+        </div>
+        <div class="field">
+          <label>Target FPS</label>
+          <input type="number" id="target-fps" min="1" step="1" placeholder="orig">
+        </div>
+      </div>
       <button class="btn btn-primary" id="upload-btn" disabled>Upload</button>
     </div>
 
@@ -216,6 +226,18 @@ canvas {
             <option value="forward">Forward</option>
             <option value="backward">Backward</option>
           </select>
+        </div>
+      </div>
+      <div class="fields">
+        <div class="field">
+          <label>Max frames</label>
+          <input type="number" id="max-frames" min="1" step="1" placeholder="all">
+        </div>
+        <div class="field">
+          <label style="display:flex;align-items:center;gap:8px;margin-top:22px;color:#888;">
+            <input type="checkbox" id="close-on-complete" checked>
+            Close session
+          </label>
         </div>
       </div>
       <div class="box-coords hidden" id="box-coords"></div>
@@ -318,7 +340,6 @@ dz.addEventListener('drop', e => {
 function selectFile(f) {
   if (s.localVideoUrl) {
     URL.revokeObjectURL(s.localVideoUrl);
-    s.localVideoUrl = null;
   }
   file = f;
   s.localVideoUrl = URL.createObjectURL(f);
@@ -335,11 +356,15 @@ $('upload-btn').onclick = async () => {
 
   const startSec = parseFloat($('start-sec').value) || 0;
   const dur = parseFloat($('dur-sec').value);
+  const resizeMaxSide = parseInt($('resize-max-side').value, 10);
+  const targetFps = parseFloat($('target-fps').value);
 
   const fd = new FormData();
   fd.append('file', file);
   fd.append('start_sec', startSec);
   if (dur > 0) fd.append('duration_sec', dur);
+  if (resizeMaxSide > 0) fd.append('resize_max_side', resizeMaxSide);
+  if (targetFps > 0) fd.append('target_fps', targetFps);
 
   try {
     const res = await fetch(`${API}/videos/upload`, { method: 'POST', body: fd });
@@ -356,7 +381,13 @@ $('upload-btn').onclick = async () => {
     log(`Uploaded — ${video.width}×${video.height}, ${video.frame_count} frames`, 'ok');
 
     await loadPoster(`${API}${video.poster_url}`);
-    await createSession();
+    $('prompt-card').classList.remove('hidden');
+    $('session-card').classList.remove('hidden');
+    $('reset-btn').classList.remove('hidden');
+    setSession('', 'Ready to track');
+    $('session-meta').textContent = `${s.videoW}×${s.videoH} · session will be created on Track`;
+    setBtn('upload-btn', 'Upload', false);
+    log('Upload complete. Draw a box and press Track.', 'ok');
   } catch (e) {
     log(`Upload failed: ${e.message}`, 'err');
     setBtn('upload-btn', 'Upload', false);
@@ -400,18 +431,16 @@ async function createSession() {
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     s.sessionId = data.session_id;
+    s.totalFrames = data.num_frames;
 
     setSession('green', `Session ready`);
     $('session-meta').textContent = `${s.videoW}×${s.videoH} · ${data.num_frames} frames · ${data.session_id.slice(0,8)}…`;
-    $('stat-total').textContent = s.totalFrames;
-    $('prompt-card').classList.remove('hidden');
-    $('reset-btn').classList.remove('hidden');
-    setBtn('upload-btn', 'Upload', false);
+    $('stat-total').textContent = data.num_frames;
     log(`Session: ${data.session_id.slice(0,8)}… (${data.num_frames} frames)`, 'ok');
   } catch (e) {
     setSession('red', 'Session failed');
     log(`Session failed: ${e.message}`, 'err');
-    setBtn('upload-btn', 'Upload', false);
+    throw e;
   }
 }
 
@@ -424,7 +453,7 @@ function toCanvas(vx, vy) {
 }
 
 canvas.addEventListener('mousedown', e => {
-  if (!s.sessionId || s.propagating) return;
+  if (!s.videoId || s.propagating) return;
   const r = canvas.getBoundingClientRect();
   draw.active = true;
   draw.x0 = draw.x1 = e.clientX - r.left;
@@ -591,7 +620,7 @@ $('clear-btn').onclick = () => {
 
 // ── Track ──────────────────────────────────────────────────────────────────
 $('track-btn').onclick = async () => {
-  if (!s.box || !s.sessionId) return;
+  if (!s.box || !s.videoId) return;
   s.propagating = true;
   s.frames = [];
   setBtn('track-btn', 'Tracking…', true);
@@ -603,6 +632,8 @@ $('track-btn').onclick = async () => {
   setSession('orange', 'Propagating…');
 
   try {
+    if (!s.sessionId) await createSession();
+
     // Add box prompt on frame 0
     log('Adding box prompt…', 'info');
     const pRes = await fetch(`${API}/sessions/${s.sessionId}/frames/0/box`, {
@@ -620,7 +651,8 @@ $('track-btn').onclick = async () => {
       body: JSON.stringify({
         start_frame_index: 0,
         direction: $('direction').value,
-        max_frames: null,
+        max_frames: parseInt($('max-frames').value, 10) || null,
+        close_on_complete: $('close-on-complete').checked,
       }),
     });
     if (!propRes.ok) throw new Error(await propRes.text());
@@ -660,6 +692,11 @@ $('track-btn').onclick = async () => {
     setSession('green', `Done — ${frameCount} frames`);
     log(`Done: ${frameCount} frames, ${objIds.size} object(s) tracked`, 'ok');
     $('render-btn').classList.remove('hidden');
+    if ($('close-on-complete').checked) {
+      s.sessionId = null;
+      setSession('', 'Ready to track again');
+      $('session-meta').textContent = `${s.videoW}×${s.videoH} · previous session closed automatically`;
+    }
   } catch (e) {
     setSession('red', 'Tracking failed');
     log(`Tracking failed: ${e.message}`, 'err');
@@ -690,9 +727,7 @@ $('render-btn').onclick = async () => {
     const vid = document.createElement('video');
     const sourceUrl = s.localVideoUrl ?? `${API}/videos/${s.videoId}/stream`;
     const startSec = s.localVideoUrl ? s.uploadStartSec : 0;
-    const clipDuration = s.localVideoUrl
-      ? (s.uploadDurationSec ?? s.durationSec)
-      : s.durationSec;
+    const clipDuration = s.localVideoUrl ? (s.uploadDurationSec ?? s.durationSec) : s.durationSec;
     vid.src = sourceUrl;
     vid.crossOrigin = 'anonymous'; vid.muted = true; vid.preload = 'auto';
     await new Promise((res, rej) => { vid.onloadedmetadata = res; vid.onerror = rej; vid.load(); });
@@ -703,12 +738,12 @@ $('render-btn').onclick = async () => {
 
     if (startSec > 0) {
       await new Promise((res, rej) => {
-        const onSeeked = () => { cleanup(); res(); };
-        const onError = () => { cleanup(); rej(new Error('Failed to seek video')); };
         const cleanup = () => {
           vid.removeEventListener('seeked', onSeeked);
           vid.removeEventListener('error', onError);
         };
+        const onSeeked = () => { cleanup(); res(); };
+        const onError = () => { cleanup(); rej(new Error('Failed to seek video')); };
         vid.addEventListener('seeked', onSeeked, { once: true });
         vid.addEventListener('error', onError, { once: true });
         vid.currentTime = startSec;
