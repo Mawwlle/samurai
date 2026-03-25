@@ -14,7 +14,8 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 
-from api.dependencies import get_predictor, get_session_repo, get_video_repo
+from api.config import Settings
+from api.dependencies import get_predictor, get_session_repo, get_settings, get_video_repo
 from api.ml import inference
 from api.ml.loader import autocast_context
 from api.repositories.session_repo import SessionRecord, SessionRepository
