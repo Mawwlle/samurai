@@ -193,16 +193,6 @@ canvas {
           <input type="number" id="dur-sec" min="0.1" step="0.5" placeholder="full">
         </div>
       </div>
-      <div class="fields">
-        <div class="field">
-          <label>Max side (px)</label>
-          <input type="number" id="resize-max-side" min="64" step="32" placeholder="orig">
-        </div>
-        <div class="field">
-          <label>Target FPS</label>
-          <input type="number" id="target-fps" min="1" step="1" placeholder="orig">
-        </div>
-      </div>
       <button class="btn btn-primary" id="upload-btn" disabled>Upload</button>
     </div>
 
@@ -226,18 +216,6 @@ canvas {
             <option value="forward">Forward</option>
             <option value="backward">Backward</option>
           </select>
-        </div>
-      </div>
-      <div class="fields">
-        <div class="field">
-          <label>Max frames</label>
-          <input type="number" id="max-frames" min="1" step="1" placeholder="all">
-        </div>
-        <div class="field">
-          <label style="display:flex;align-items:center;gap:8px;margin-top:22px;color:#888;">
-            <input type="checkbox" id="close-on-complete" checked>
-            Close session
-          </label>
         </div>
       </div>
       <div class="box-coords hidden" id="box-coords"></div>
@@ -356,15 +334,11 @@ $('upload-btn').onclick = async () => {
 
   const startSec = parseFloat($('start-sec').value) || 0;
   const dur = parseFloat($('dur-sec').value);
-  const resizeMaxSide = parseInt($('resize-max-side').value, 10);
-  const targetFps = parseFloat($('target-fps').value);
 
   const fd = new FormData();
   fd.append('file', file);
   fd.append('start_sec', startSec);
   if (dur > 0) fd.append('duration_sec', dur);
-  if (resizeMaxSide > 0) fd.append('resize_max_side', resizeMaxSide);
-  if (targetFps > 0) fd.append('target_fps', targetFps);
 
   try {
     const res = await fetch(`${API}/videos/upload`, { method: 'POST', body: fd });
@@ -651,8 +625,8 @@ $('track-btn').onclick = async () => {
       body: JSON.stringify({
         start_frame_index: 0,
         direction: $('direction').value,
-        max_frames: parseInt($('max-frames').value, 10) || null,
-        close_on_complete: $('close-on-complete').checked,
+        max_frames: null,
+        close_on_complete: true,
       }),
     });
     if (!propRes.ok) throw new Error(await propRes.text());
@@ -692,11 +666,9 @@ $('track-btn').onclick = async () => {
     setSession('green', `Done — ${frameCount} frames`);
     log(`Done: ${frameCount} frames, ${objIds.size} object(s) tracked`, 'ok');
     $('render-btn').classList.remove('hidden');
-    if ($('close-on-complete').checked) {
-      s.sessionId = null;
-      setSession('', 'Ready to track again');
-      $('session-meta').textContent = `${s.videoW}×${s.videoH} · previous session closed automatically`;
-    }
+    s.sessionId = null;
+    setSession('', 'Ready to track again');
+    $('session-meta').textContent = `${s.videoW}×${s.videoH} · previous session closed automatically`;
   } catch (e) {
     setSession('red', 'Tracking failed');
     log(`Tracking failed: ${e.message}`, 'err');
