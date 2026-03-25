@@ -193,6 +193,10 @@ canvas {
           <input type="number" id="dur-sec" min="0.1" step="0.5" placeholder="full">
         </div>
       </div>
+      <div class="progress-wrap hidden" id="upload-progress-wrap" style="margin-top:10px;">
+        <div class="progress-bar" id="upload-progress-bar"></div>
+      </div>
+      <div class="hidden" style="font-size:11px;color:#888;margin-top:6px;" id="upload-status"></div>
       <button class="btn btn-primary" id="upload-btn" disabled>Upload</button>
     </div>
 
@@ -269,6 +273,7 @@ canvas {
 
 <script>
 const API = 'http://localhost:8321';
+const UPLOAD_CHUNK_SIZE = 1024 * 1024;
 
 // ── State ──────────────────────────────────────────────────────────────────
 const s = {
@@ -331,19 +336,57 @@ $('upload-btn').onclick = async () => {
   if (!file) return;
   setBtn('upload-btn', 'Uploading…', true);
   log('Uploading…', 'info');
+  $('upload-progress-wrap').classList.remove('hidden');
+  $('upload-status').classList.remove('hidden');
+  $('upload-progress-bar').style.width = '0%';
+  $('upload-status').textContent = 'Preparing upload…';
 
   const startSec = parseFloat($('start-sec').value) || 0;
   const dur = parseFloat($('dur-sec').value);
 
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('start_sec', startSec);
-  if (dur > 0) fd.append('duration_sec', dur);
-
   try {
-    const res = await fetch(`${API}/videos/upload`, { method: 'POST', body: fd });
-    if (!res.ok) throw new Error(await res.text());
-    const { video } = await res.json();
+    const initRes = await fetch(`${API}/videos/upload/init`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: file.name,
+        start_sec: startSec,
+        duration_sec: dur > 0 ? dur : null,
+      }),
+    });
+    if (!initRes.ok) throw new Error(await initRes.text());
+    const initData = await initRes.json();
+    const totalChunks = Math.ceil(file.size / UPLOAD_CHUNK_SIZE);
+
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const start = chunkIndex * UPLOAD_CHUNK_SIZE;
+      const end = Math.min(file.size, start + UPLOAD_CHUNK_SIZE);
+      const chunk = file.slice(start, end);
+      const chunkRes = await fetch(`${API}/videos/upload/${initData.upload_id}/chunk/${chunkIndex}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: chunk,
+      });
+      if (!chunkRes.ok) throw new Error(await chunkRes.text());
+
+      const pct = Math.round(((chunkIndex + 1) / totalChunks) * 100);
+      $('upload-progress-bar').style.width = `${pct}%`;
+      $('upload-status').textContent = `Uploading… ${chunkIndex + 1}/${totalChunks} chunks (${pct}%)`;
+    }
+
+    $('upload-status').textContent = 'Finalizing upload…';
+    const completeRes = await fetch(`${API}/videos/upload/${initData.upload_id}/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: file.name,
+        total_chunks: totalChunks,
+        start_sec: startSec,
+        duration_sec: dur > 0 ? dur : null,
+      }),
+    });
+    if (!completeRes.ok) throw new Error(await completeRes.text());
+    const { video } = await completeRes.json();
 
     s.videoId = video.id;
     s.videoW = video.width;
@@ -361,9 +404,12 @@ $('upload-btn').onclick = async () => {
     setSession('', 'Ready to track');
     $('session-meta').textContent = `${s.videoW}×${s.videoH} · session will be created on Track`;
     setBtn('upload-btn', 'Upload', false);
+    $('upload-progress-bar').style.width = '100%';
+    $('upload-status').textContent = 'Upload complete';
     log('Upload complete. Draw a box and press Track.', 'ok');
   } catch (e) {
     log(`Upload failed: ${e.message}`, 'err');
+    $('upload-status').textContent = 'Upload failed';
     setBtn('upload-btn', 'Upload', false);
   }
 };
@@ -821,6 +867,10 @@ $('reset-btn').onclick = async () => {
   });
   $('render-btn').classList.add('hidden');
   $('render-status').classList.add('hidden');
+  $('upload-progress-wrap').classList.add('hidden');
+  $('upload-status').classList.add('hidden');
+  $('upload-progress-bar').style.width = '0%';
+  $('upload-status').textContent = '';
   draw.active = false;
   canvas.classList.add('hidden');
   $('canvas-placeholder').classList.remove('hidden');

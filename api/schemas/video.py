@@ -49,6 +49,38 @@ class VideoUploadResponse(BaseModel):
     video: VideoDTO
 
 
+class ChunkedUploadInitRequest(BaseModel):
+    """Request body for starting a chunked upload session."""
+
+    filename: str
+    start_sec: float = Field(default=0.0, ge=0.0)
+    duration_sec: float | None = Field(default=None, gt=0.0)
+
+
+class ChunkedUploadInitResponse(BaseModel):
+    """Response returned when a chunked upload session is created."""
+
+    upload_id: str
+    chunk_size_bytes: int
+
+
+class ChunkedUploadChunkResponse(BaseModel):
+    """Response returned after storing one uploaded chunk."""
+
+    upload_id: str
+    chunk_index: int
+    received_chunks: int
+
+
+class ChunkedUploadCompleteRequest(BaseModel):
+    """Request body for finalizing a chunked upload."""
+
+    filename: str
+    total_chunks: int = Field(gt=0)
+    start_sec: float = Field(default=0.0, ge=0.0)
+    duration_sec: float | None = Field(default=None, gt=0.0)
+
+
 class VideoTrimParams(BaseModel):
     """Optional trim parameters for video upload.
 
