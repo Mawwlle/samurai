@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import shutil
-import subprocess
 import uuid
 from collections.abc import AsyncGenerator, Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -40,22 +39,6 @@ from api.schemas.tracking import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["Sessions"])
-
-
-def _extract_frames(video_path: Path, frames_dir: Path, ffmpeg_threads: int) -> None:
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-threads", str(ffmpeg_threads),
-        "-q:v", "2",
-        str(frames_dir / "%05d.jpg"),
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            f"ffmpeg frame extraction failed for '{video_path.name}': {exc.stderr.decode().strip()}"
-        ) from exc
 
 _propagation_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="propagation")
 
@@ -157,24 +140,24 @@ async def create_session(
     predictor: SAM2VideoPredictor = Depends(get_predictor),
     session_repo: SessionRepository = Depends(get_session_repo),
     video_repo: VideoRepository = Depends(get_video_repo),
-    settings: Settings = Depends(get_settings),
 ) -> SessionDTO:
     """Create a new tracking session for the specified video."""
 
     video = video_repo.get(body.video_id)
-
-    frames_dir = Path(video.frames_path)
-    if not frames_dir.exists():
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(_extract_frames, Path(video.video_path), frames_dir, settings.ffmpeg_threads)
-        logger.info("Extracted frames for video %s to %s", body.video_id, frames_dir)
+    source_path = Path(video.video_path)
+    if source_path.is_dir():
+        init_path = source_path
+        logger.info("Initialising session %s from frame directory %s", body.video_id, init_path)
+    else:
+        init_path = source_path
+        logger.info("Initialising session %s directly from video file %s", body.video_id, init_path)
 
     offload = predictor.device.type == "mps"
 
     def _init() -> inference.InferenceState:
         ctx = autocast_context(predictor.device)
         with ctx:
-            return inference.init_state(predictor, str(frames_dir), offload_video_to_cpu=offload)
+            return inference.init_state(predictor, str(init_path), offload_video_to_cpu=offload)
 
     state = await asyncio.to_thread(_init)
 

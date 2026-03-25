@@ -193,6 +193,10 @@ canvas {
           <input type="number" id="dur-sec" min="0.1" step="0.5" placeholder="full">
         </div>
       </div>
+      <div class="progress-wrap hidden" id="upload-progress-wrap" style="margin-top:10px;">
+        <div class="progress-bar" id="upload-progress-bar"></div>
+      </div>
+      <div class="hidden" style="font-size:11px;color:#888;margin-top:6px;" id="upload-status"></div>
       <button class="btn btn-primary" id="upload-btn" disabled>Upload</button>
     </div>
 
@@ -269,11 +273,14 @@ canvas {
 
 <script>
 const API = 'http://localhost:8000';
+const UPLOAD_CHUNK_SIZE = 1024 * 1024;
 
 // ── State ──────────────────────────────────────────────────────────────────
 const s = {
   videoId: null, sessionId: null,
   videoW: 0, videoH: 0, totalFrames: 0, durationSec: 0,
+  uploadStartSec: 0, uploadDurationSec: null,
+  localVideoUrl: null,
   posterImg: null,
   box: null,           // [x1, y1, x2, y2] video coords
   frames: [],          // collected TrackingFrameDTO
@@ -314,7 +321,11 @@ dz.addEventListener('drop', e => {
 });
 
 function selectFile(f) {
+  if (s.localVideoUrl) {
+    URL.revokeObjectURL(s.localVideoUrl);
+  }
   file = f;
+  s.localVideoUrl = URL.createObjectURL(f);
   $('drop-label').innerHTML = `<b>${f.name}</b><br><span style="font-size:11px;color:#555">${(f.size/1024/1024).toFixed(1)} MB</span>`;
   $('upload-btn').disabled = false;
   log(`Selected: ${f.name}`, 'muted');
@@ -325,29 +336,80 @@ $('upload-btn').onclick = async () => {
   if (!file) return;
   setBtn('upload-btn', 'Uploading…', true);
   log('Uploading…', 'info');
+  $('upload-progress-wrap').classList.remove('hidden');
+  $('upload-status').classList.remove('hidden');
+  $('upload-progress-bar').style.width = '0%';
+  $('upload-status').textContent = 'Preparing upload…';
 
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('start_sec', parseFloat($('start-sec').value) || 0);
+  const startSec = parseFloat($('start-sec').value) || 0;
   const dur = parseFloat($('dur-sec').value);
-  if (dur > 0) fd.append('duration_sec', dur);
 
   try {
-    const res = await fetch(`${API}/videos/upload`, { method: 'POST', body: fd });
-    if (!res.ok) throw new Error(await res.text());
-    const { video } = await res.json();
+    const initRes = await fetch(`${API}/videos/upload/init`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: file.name,
+        start_sec: startSec,
+        duration_sec: dur > 0 ? dur : null,
+      }),
+    });
+    if (!initRes.ok) throw new Error(await initRes.text());
+    const initData = await initRes.json();
+    const totalChunks = Math.ceil(file.size / UPLOAD_CHUNK_SIZE);
+
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const start = chunkIndex * UPLOAD_CHUNK_SIZE;
+      const end = Math.min(file.size, start + UPLOAD_CHUNK_SIZE);
+      const chunk = file.slice(start, end);
+      const chunkRes = await fetch(`${API}/videos/upload/${initData.upload_id}/chunk/${chunkIndex}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: chunk,
+      });
+      if (!chunkRes.ok) throw new Error(await chunkRes.text());
+
+      const pct = Math.round(((chunkIndex + 1) / totalChunks) * 100);
+      $('upload-progress-bar').style.width = `${pct}%`;
+      $('upload-status').textContent = `Uploading… ${chunkIndex + 1}/${totalChunks} chunks (${pct}%)`;
+    }
+
+    $('upload-status').textContent = 'Finalizing upload…';
+    const completeRes = await fetch(`${API}/videos/upload/${initData.upload_id}/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: file.name,
+        total_chunks: totalChunks,
+        start_sec: startSec,
+        duration_sec: dur > 0 ? dur : null,
+      }),
+    });
+    if (!completeRes.ok) throw new Error(await completeRes.text());
+    const { video } = await completeRes.json();
 
     s.videoId = video.id;
     s.videoW = video.width;
     s.videoH = video.height;
     s.totalFrames = video.frame_count ?? 0;
     s.durationSec = video.duration_sec ?? 0;
+    s.uploadStartSec = startSec;
+    s.uploadDurationSec = dur > 0 ? dur : null;
     log(`Uploaded — ${video.width}×${video.height}, ${video.frame_count} frames`, 'ok');
 
     await loadPoster(`${API}${video.poster_url}`);
-    await createSession();
+    $('prompt-card').classList.remove('hidden');
+    $('session-card').classList.remove('hidden');
+    $('reset-btn').classList.remove('hidden');
+    setSession('', 'Ready to track');
+    $('session-meta').textContent = `${s.videoW}×${s.videoH} · session will be created on Track`;
+    setBtn('upload-btn', 'Upload', false);
+    $('upload-progress-bar').style.width = '100%';
+    $('upload-status').textContent = 'Upload complete';
+    log('Upload complete. Draw a box and press Track.', 'ok');
   } catch (e) {
     log(`Upload failed: ${e.message}`, 'err');
+    $('upload-status').textContent = 'Upload failed';
     setBtn('upload-btn', 'Upload', false);
   }
 };
@@ -389,18 +451,16 @@ async function createSession() {
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     s.sessionId = data.session_id;
+    s.totalFrames = data.num_frames;
 
     setSession('green', `Session ready`);
     $('session-meta').textContent = `${s.videoW}×${s.videoH} · ${data.num_frames} frames · ${data.session_id.slice(0,8)}…`;
-    $('stat-total').textContent = s.totalFrames;
-    $('prompt-card').classList.remove('hidden');
-    $('reset-btn').classList.remove('hidden');
-    setBtn('upload-btn', 'Upload', false);
+    $('stat-total').textContent = data.num_frames;
     log(`Session: ${data.session_id.slice(0,8)}… (${data.num_frames} frames)`, 'ok');
   } catch (e) {
     setSession('red', 'Session failed');
     log(`Session failed: ${e.message}`, 'err');
-    setBtn('upload-btn', 'Upload', false);
+    throw e;
   }
 }
 
@@ -413,7 +473,7 @@ function toCanvas(vx, vy) {
 }
 
 canvas.addEventListener('mousedown', e => {
-  if (!s.sessionId || s.propagating) return;
+  if (!s.videoId || s.propagating) return;
   const r = canvas.getBoundingClientRect();
   draw.active = true;
   draw.x0 = draw.x1 = e.clientX - r.left;
@@ -580,7 +640,7 @@ $('clear-btn').onclick = () => {
 
 // ── Track ──────────────────────────────────────────────────────────────────
 $('track-btn').onclick = async () => {
-  if (!s.box || !s.sessionId) return;
+  if (!s.box || !s.videoId) return;
   s.propagating = true;
   s.frames = [];
   setBtn('track-btn', 'Tracking…', true);
@@ -592,6 +652,8 @@ $('track-btn').onclick = async () => {
   setSession('orange', 'Propagating…');
 
   try {
+    if (!s.sessionId) await createSession();
+
     // Add box prompt on frame 0
     log('Adding box prompt…', 'info');
     const pRes = await fetch(`${API}/sessions/${s.sessionId}/frames/0/box`, {
@@ -610,6 +672,7 @@ $('track-btn').onclick = async () => {
         start_frame_index: 0,
         direction: $('direction').value,
         max_frames: null,
+        close_on_complete: true,
       }),
     });
     if (!propRes.ok) throw new Error(await propRes.text());
@@ -649,6 +712,9 @@ $('track-btn').onclick = async () => {
     setSession('green', `Done — ${frameCount} frames`);
     log(`Done: ${frameCount} frames, ${objIds.size} object(s) tracked`, 'ok');
     $('render-btn').classList.remove('hidden');
+    s.sessionId = null;
+    setSession('', 'Ready to track again');
+    $('session-meta').textContent = `${s.videoW}×${s.videoH} · previous session closed automatically`;
   } catch (e) {
     setSession('red', 'Tracking failed');
     log(`Tracking failed: ${e.message}`, 'err');
@@ -677,9 +743,30 @@ $('render-btn').onclick = async () => {
     const rctx = rc.getContext('2d');
 
     const vid = document.createElement('video');
-    vid.src = `${API}/videos/${s.videoId}/stream`;
+    const sourceUrl = s.localVideoUrl ?? `${API}/videos/${s.videoId}/stream`;
+    const startSec = s.localVideoUrl ? s.uploadStartSec : 0;
+    const clipDuration = s.localVideoUrl ? (s.uploadDurationSec ?? s.durationSec) : s.durationSec;
+    vid.src = sourceUrl;
     vid.crossOrigin = 'anonymous'; vid.muted = true; vid.preload = 'auto';
-    await new Promise((res, rej) => { vid.onloadeddata = res; vid.onerror = rej; vid.load(); });
+    await new Promise((res, rej) => { vid.onloadedmetadata = res; vid.onerror = rej; vid.load(); });
+
+    const endSec = clipDuration > 0
+      ? Math.min(vid.duration || Number.POSITIVE_INFINITY, startSec + clipDuration)
+      : (vid.duration || Number.POSITIVE_INFINITY);
+
+    if (startSec > 0) {
+      await new Promise((res, rej) => {
+        const cleanup = () => {
+          vid.removeEventListener('seeked', onSeeked);
+          vid.removeEventListener('error', onError);
+        };
+        const onSeeked = () => { cleanup(); res(); };
+        const onError = () => { cleanup(); rej(new Error('Failed to seek video')); };
+        vid.addEventListener('seeked', onSeeked, { once: true });
+        vid.addEventListener('error', onError, { once: true });
+        vid.currentTime = startSec;
+      });
+    }
 
     const mimeType = ['video/webm;codecs=vp9', 'video/webm', 'video/mp4']
       .find(t => MediaRecorder.isTypeSupported(t)) ?? 'video/webm';
@@ -704,11 +791,25 @@ $('render-btn').onclick = async () => {
     statusEl.textContent = 'Rendering…';
 
     await new Promise(res => {
-      vid.onended = () => { recorder.stop(); res(); };
+      let stopped = false;
+      const stopRecording = () => {
+        if (stopped) return;
+        stopped = true;
+        vid.pause();
+        recorder.stop();
+        res();
+      };
+
+      vid.onended = stopRecording;
       vid.onplay = () => {
         function draw() {
           if (vid.ended || vid.paused) return;
-          const fi = Math.round(vid.currentTime * fps);
+          if (vid.currentTime >= endSec) {
+            stopRecording();
+            return;
+          }
+
+          const fi = Math.round(Math.max(0, vid.currentTime - startSec) * fps);
           rctx.drawImage(vid, 0, 0, rc.width, rc.height);
           const frame = frameMap.get(fi) ?? frameMap.get(fi - 1) ?? frameMap.get(fi + 1);
           if (frame) {
@@ -726,7 +827,8 @@ $('render-btn').onclick = async () => {
               }
             }
           }
-          const pct = Math.round(vid.currentTime / vid.duration * 100);
+          const denom = Math.max(0.001, endSec - startSec);
+          const pct = Math.round(Math.min(1, Math.max(0, (vid.currentTime - startSec) / denom)) * 100);
           statusEl.textContent = `Rendering… ${pct}%`;
           requestAnimationFrame(draw);
         }
@@ -754,9 +856,21 @@ $('reset-btn').onclick = async () => {
       log('Session closed', 'muted');
     } catch {}
   }
-  Object.assign(s, { videoId: null, sessionId: null, videoW: 0, videoH: 0, totalFrames: 0, durationSec: 0, posterImg: null, box: null, frames: [], propagating: false });
+  if (s.localVideoUrl) {
+    URL.revokeObjectURL(s.localVideoUrl);
+  }
+  Object.assign(s, {
+    videoId: null, sessionId: null,
+    videoW: 0, videoH: 0, totalFrames: 0, durationSec: 0,
+    uploadStartSec: 0, uploadDurationSec: null, localVideoUrl: null,
+    posterImg: null, box: null, frames: [], propagating: false,
+  });
   $('render-btn').classList.add('hidden');
   $('render-status').classList.add('hidden');
+  $('upload-progress-wrap').classList.add('hidden');
+  $('upload-status').classList.add('hidden');
+  $('upload-progress-bar').style.width = '0%';
+  $('upload-status').textContent = '';
   draw.active = false;
   canvas.classList.add('hidden');
   $('canvas-placeholder').classList.remove('hidden');
