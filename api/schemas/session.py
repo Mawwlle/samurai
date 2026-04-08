@@ -87,6 +87,23 @@ class AddBoxRequest(BaseModel):
     }}}
 
 
+class AddMaskRequest(BaseModel):
+    """Request body for adding a polygon mask prompt to a frame.
+
+    Attributes:
+        object_id: Identifier for the object being tracked (must be >= 0).
+        polygon: Polygon points as ``[[x, y], ...]`` in pixels.
+    """
+
+    object_id: int = Field(ge=0)
+    polygon: list[tuple[float, float]] = Field(min_length=3)
+
+    model_config = {"json_schema_extra": {"example": {
+        "object_id": 0,
+        "polygon": [[100, 80], [300, 90], [280, 260], [120, 240]],
+    }}}
+
+
 class PropagateRequest(BaseModel):
     """Request body for video propagation.
 

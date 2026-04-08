@@ -4,6 +4,7 @@ All dependencies are injected from the application state set during lifespan.
 """
 
 from fastapi import Request
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 
 from api.config import Settings
@@ -35,6 +36,12 @@ def get_predictor(request: Request) -> SAM2VideoPredictor:
     """
 
     return request.app.state.predictor
+
+
+def get_image_predictor(request: Request) -> SAM2ImagePredictor:
+    """Return the shared SAM2 image predictor from app state."""
+
+    return request.app.state.image_predictor
 
 
 def get_session_repo(request: Request) -> SessionRepository:

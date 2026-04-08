@@ -43,6 +43,7 @@ class ObjectTrackDTO(BaseModel):
     object_id: int
     mask: RLEMaskDTO | None
     bbox: BoundingBoxDTO | None
+    polygon: list[list[int]] | None = None
 
 
 class TrackingFrameDTO(BaseModel):

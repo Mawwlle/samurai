@@ -1,17 +1,21 @@
-"""Pure inference functions wrapping SAM2VideoPredictor.
+"""Pure inference functions wrapping SAM2 predictors.
 
 All functions are stateless with respect to the predictor — the mutable
 ``inference_state`` is owned by the caller (session repository) and passed
 explicitly. IO and device context management are handled at the call site.
 """
 
+import logging
 from collections.abc import Generator
 from typing import TypedDict
 
+import cv2
 import numpy as np
 import pycocotools.mask as mask_util
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 
+from api.schemas.image import ImageSegmentationObjectDTO
 from api.schemas.tracking import (
     BoundingBoxDTO,
     FramePromptsDTO,
@@ -19,6 +23,8 @@ from api.schemas.tracking import (
     RLEMaskDTO,
     TrackingFrameDTO,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class InferenceState(TypedDict):
@@ -150,6 +156,31 @@ def add_box(
     )
 
 
+def add_mask(
+    predictor: SAM2VideoPredictor,
+    state: InferenceState,
+    frame_index: int,
+    object_id: int,
+    mask: np.ndarray,
+    score_thresh: float,
+) -> FramePromptsDTO:
+    """Add a binary mask prompt to a frame and return the updated mask."""
+
+    frame_idx, object_ids, masks = predictor.add_new_mask(
+        inference_state=state,
+        frame_idx=frame_index,
+        obj_id=object_id,
+        mask=mask.astype(np.uint8),
+    )
+
+    masks_binary = (masks > score_thresh)[:, 0].cpu().numpy()
+
+    return FramePromptsDTO(
+        frame_index=int(frame_idx),
+        objects=_build_object_tracks(object_ids, masks_binary),
+    )
+
+
 def clear_frame_prompts(
     predictor: SAM2VideoPredictor,
     state: InferenceState,
@@ -242,32 +273,54 @@ def propagate_in_video(
 
     run_forward = direction in ("forward", "both")
     run_backward = direction in ("backward", "both")
+    yielded_frame_indices: set[int] = set()
+    yielded_count = 0
+
+    def _yield_tracking_frames(reverse: bool) -> Generator[TrackingFrameDTO, None, None]:
+        nonlocal yielded_count
+        yielded_this_direction = 0
+        logger.info(
+            "SAMURAI propagate start: start_frame=%d direction=%s reverse=%s max_frames=%s",
+            start_frame_index,
+            direction,
+            reverse,
+            max_frames,
+        )
+        for frame_idx, obj_ids, masks in predictor.propagate_in_video(
+            inference_state=state,
+            start_frame_idx=start_frame_index,
+            max_frame_num_to_track=max_frames,
+            reverse=reverse,
+        ):
+            if frame_idx in yielded_frame_indices:
+                continue
+            yielded_frame_indices.add(int(frame_idx))
+            masks_binary = (masks > score_thresh)[:, 0].cpu().numpy()
+            yielded_count += 1
+            yielded_this_direction += 1
+            if yielded_this_direction <= 5 or yielded_this_direction % 50 == 0:
+                logger.info(
+                    "SAMURAI propagate frame: reverse=%s frame_index=%d yielded_total=%d",
+                    reverse,
+                    int(frame_idx),
+                    yielded_count,
+                )
+            yield TrackingFrameDTO(
+                frame_index=int(frame_idx),
+                objects=_build_object_tracks(obj_ids, masks_binary),
+            )
+        logger.info(
+            "SAMURAI propagate end: reverse=%s yielded_this_direction=%d yielded_total=%d",
+            reverse,
+            yielded_this_direction,
+            yielded_count,
+        )
 
     if run_forward:
-        for frame_idx, obj_ids, masks in predictor.propagate_in_video(
-            inference_state=state,
-            start_frame_idx=start_frame_index,
-            max_frame_num_to_track=max_frames,
-            reverse=False,
-        ):
-            masks_binary = (masks > score_thresh)[:, 0].cpu().numpy()
-            yield TrackingFrameDTO(
-                frame_index=int(frame_idx),
-                objects=_build_object_tracks(obj_ids, masks_binary),
-            )
+        yield from _yield_tracking_frames(reverse=False)
 
     if run_backward:
-        for frame_idx, obj_ids, masks in predictor.propagate_in_video(
-            inference_state=state,
-            start_frame_idx=start_frame_index,
-            max_frame_num_to_track=max_frames,
-            reverse=True,
-        ):
-            masks_binary = (masks > score_thresh)[:, 0].cpu().numpy()
-            yield TrackingFrameDTO(
-                frame_index=int(frame_idx),
-                objects=_build_object_tracks(obj_ids, masks_binary),
-            )
+        yield from _yield_tracking_frames(reverse=True)
 
 
 def _encode_mask(mask: np.ndarray) -> RLEMaskDTO:
@@ -314,6 +367,27 @@ def _mask_to_bbox(mask: np.ndarray) -> BoundingBoxDTO | None:
     )
 
 
+def _mask_to_polygon(mask: np.ndarray) -> list[list[int]] | None:
+    """Approximate a binary mask contour as a polygon."""
+
+    mask_uint8 = mask.astype(np.uint8)
+    if mask_uint8.max() == 0:
+        return None
+
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    if len(contour) < 3:
+        return None
+
+    epsilon = max(1.5, 0.002 * cv2.arcLength(contour, True))
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+    points = [[int(point[0][0]), int(point[0][1])] for point in approx]
+    return points if len(points) >= 3 else None
+
+
 def _build_object_tracks(
     object_ids: list[int],
     masks: np.ndarray,
@@ -336,6 +410,51 @@ def _build_object_tracks(
                 object_id=int(obj_id),
                 mask=_encode_mask(mask) if has_object else None,
                 bbox=_mask_to_bbox(mask) if has_object else None,
+                polygon=_mask_to_polygon(mask) if has_object else None,
             )
         )
+    return results
+
+
+def segment_image_with_boxes(
+    predictor: SAM2ImagePredictor,
+    image: np.ndarray,
+    prompts: list[tuple[str | None, tuple[float, float, float, float], tuple[float, float] | None]],
+    score_thresh: float,
+) -> list[ImageSegmentationObjectDTO]:
+    """Segment a static image with SAM2 using box prompts."""
+
+    predictor.set_image(image)
+    results: list[ImageSegmentationObjectDTO] = []
+
+    for label, box, point in prompts:
+        point_coords = None
+        point_labels = None
+        if point is not None:
+            point_coords = np.array([[point[0], point[1]]], dtype=np.float32)
+            point_labels = np.array([1], dtype=np.int32)
+        masks, ious, _ = predictor.predict(
+            point_coords=point_coords,
+            point_labels=point_labels,
+            box=np.array(box, dtype=np.float32),
+            multimask_output=False,
+            return_logits=False,
+            normalize_coords=False,
+        )
+        if len(masks) == 0:
+            results.append(ImageSegmentationObjectDTO(label=label, bbox=None, mask=None, polygon=None))
+            continue
+
+        best_index = int(np.argmax(ious)) if len(ious) > 1 else 0
+        mask = masks[best_index] > score_thresh
+        has_object = bool(mask.any())
+        results.append(
+            ImageSegmentationObjectDTO(
+                label=label,
+                bbox=_mask_to_bbox(mask) if has_object else None,
+                mask=_encode_mask(mask) if has_object else None,
+                polygon=_mask_to_polygon(mask) if has_object else None,
+            )
+        )
+
     return results
