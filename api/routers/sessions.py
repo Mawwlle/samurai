@@ -10,8 +10,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
+from PIL import Image, ImageDraw
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 
 from api.config import Settings
@@ -22,6 +24,7 @@ from api.repositories.session_repo import SessionRecord, SessionRepository
 from api.repositories.video_repo import VideoRepository
 from api.schemas.session import (
     AddBoxRequest,
+    AddMaskRequest,
     AddPointsRequest,
     CloseSessionResponse,
     CreateSessionRequest,
@@ -283,6 +286,46 @@ def add_box(
             frame_index=frame_index,
             object_id=body.object_id,
             box=body.box,
+            score_thresh=settings.score_thresh,
+        )
+
+
+@router.post(
+    "/{session_id}/frames/{frame_index}/mask",
+    response_model=FramePromptsDTO,
+    summary="Add polygon mask prompt",
+    description=(
+        "Add a polygon-derived mask prompt to a specific frame. "
+        "Returns the updated segmentation mask for that frame immediately."
+    ),
+)
+def add_mask(
+    session_id: str,
+    frame_index: int,
+    body: AddMaskRequest,
+    predictor: SAM2VideoPredictor = Depends(get_predictor),
+    session_repo: SessionRepository = Depends(get_session_repo),
+    settings: Settings = Depends(get_settings),
+) -> FramePromptsDTO:
+    """Add a polygon mask prompt and return the updated frame mask."""
+
+    record = session_repo.get(session_id)
+    video_width = int(record.inference_state["video_width"])
+    video_height = int(record.inference_state["video_height"])
+
+    mask_image = Image.new("L", (video_width, video_height), 0)
+    draw = ImageDraw.Draw(mask_image)
+    draw.polygon([(float(x), float(y)) for x, y in body.polygon], fill=1)
+    mask = np.array(mask_image, dtype=np.uint8)
+
+    ctx = autocast_context(predictor.device)
+    with ctx:
+        return inference.add_mask(
+            predictor=predictor,
+            state=record.inference_state,
+            frame_index=frame_index,
+            object_id=body.object_id,
+            mask=mask,
             score_thresh=settings.score_thresh,
         )
 

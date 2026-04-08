@@ -9,6 +9,7 @@ import logging
 from collections.abc import Generator
 from typing import TypedDict
 
+import cv2
 import numpy as np
 import pycocotools.mask as mask_util
 from sam2.sam2_video_predictor import SAM2VideoPredictor
@@ -143,6 +144,31 @@ def add_box(
         frame_idx=frame_index,
         obj_id=object_id,
         box=box_arr,
+    )
+
+    masks_binary = (masks > score_thresh)[:, 0].cpu().numpy()
+
+    return FramePromptsDTO(
+        frame_index=int(frame_idx),
+        objects=_build_object_tracks(object_ids, masks_binary),
+    )
+
+
+def add_mask(
+    predictor: SAM2VideoPredictor,
+    state: InferenceState,
+    frame_index: int,
+    object_id: int,
+    mask: np.ndarray,
+    score_thresh: float,
+) -> FramePromptsDTO:
+    """Add a binary mask prompt to a frame and return the updated mask."""
+
+    frame_idx, object_ids, masks = predictor.add_new_mask(
+        inference_state=state,
+        frame_idx=frame_index,
+        obj_id=object_id,
+        mask=mask.astype(np.uint8),
     )
 
     masks_binary = (masks > score_thresh)[:, 0].cpu().numpy()
@@ -339,6 +365,27 @@ def _mask_to_bbox(mask: np.ndarray) -> BoundingBoxDTO | None:
     )
 
 
+def _mask_to_polygon(mask: np.ndarray) -> list[list[int]] | None:
+    """Approximate a binary mask contour as a polygon."""
+
+    mask_uint8 = mask.astype(np.uint8)
+    if mask_uint8.max() == 0:
+        return None
+
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    if len(contour) < 3:
+        return None
+
+    epsilon = max(1.5, 0.002 * cv2.arcLength(contour, True))
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+    points = [[int(point[0][0]), int(point[0][1])] for point in approx]
+    return points if len(points) >= 3 else None
+
+
 def _build_object_tracks(
     object_ids: list[int],
     masks: np.ndarray,
@@ -361,6 +408,7 @@ def _build_object_tracks(
                 object_id=int(obj_id),
                 mask=_encode_mask(mask) if has_object else None,
                 bbox=_mask_to_bbox(mask) if has_object else None,
+                polygon=_mask_to_polygon(mask) if has_object else None,
             )
         )
     return results
