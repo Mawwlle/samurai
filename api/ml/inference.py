@@ -5,6 +5,7 @@ All functions are stateless with respect to the predictor — the mutable
 explicitly. IO and device context management are handled at the call site.
 """
 
+import logging
 from collections.abc import Generator
 from typing import TypedDict
 
@@ -19,6 +20,8 @@ from api.schemas.tracking import (
     RLEMaskDTO,
     TrackingFrameDTO,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class InferenceState(TypedDict):
@@ -242,32 +245,54 @@ def propagate_in_video(
 
     run_forward = direction in ("forward", "both")
     run_backward = direction in ("backward", "both")
+    yielded_frame_indices: set[int] = set()
+    yielded_count = 0
+
+    def _yield_tracking_frames(reverse: bool) -> Generator[TrackingFrameDTO, None, None]:
+        nonlocal yielded_count
+        yielded_this_direction = 0
+        logger.info(
+            "SAMURAI propagate start: start_frame=%d direction=%s reverse=%s max_frames=%s",
+            start_frame_index,
+            direction,
+            reverse,
+            max_frames,
+        )
+        for frame_idx, obj_ids, masks in predictor.propagate_in_video(
+            inference_state=state,
+            start_frame_idx=start_frame_index,
+            max_frame_num_to_track=max_frames,
+            reverse=reverse,
+        ):
+            if frame_idx in yielded_frame_indices:
+                continue
+            yielded_frame_indices.add(int(frame_idx))
+            masks_binary = (masks > score_thresh)[:, 0].cpu().numpy()
+            yielded_count += 1
+            yielded_this_direction += 1
+            if yielded_this_direction <= 5 or yielded_this_direction % 50 == 0:
+                logger.info(
+                    "SAMURAI propagate frame: reverse=%s frame_index=%d yielded_total=%d",
+                    reverse,
+                    int(frame_idx),
+                    yielded_count,
+                )
+            yield TrackingFrameDTO(
+                frame_index=int(frame_idx),
+                objects=_build_object_tracks(obj_ids, masks_binary),
+            )
+        logger.info(
+            "SAMURAI propagate end: reverse=%s yielded_this_direction=%d yielded_total=%d",
+            reverse,
+            yielded_this_direction,
+            yielded_count,
+        )
 
     if run_forward:
-        for frame_idx, obj_ids, masks in predictor.propagate_in_video(
-            inference_state=state,
-            start_frame_idx=start_frame_index,
-            max_frame_num_to_track=max_frames,
-            reverse=False,
-        ):
-            masks_binary = (masks > score_thresh)[:, 0].cpu().numpy()
-            yield TrackingFrameDTO(
-                frame_index=int(frame_idx),
-                objects=_build_object_tracks(obj_ids, masks_binary),
-            )
+        yield from _yield_tracking_frames(reverse=False)
 
     if run_backward:
-        for frame_idx, obj_ids, masks in predictor.propagate_in_video(
-            inference_state=state,
-            start_frame_idx=start_frame_index,
-            max_frame_num_to_track=max_frames,
-            reverse=True,
-        ):
-            masks_binary = (masks > score_thresh)[:, 0].cpu().numpy()
-            yield TrackingFrameDTO(
-                frame_index=int(frame_idx),
-                objects=_build_object_tracks(obj_ids, masks_binary),
-            )
+        yield from _yield_tracking_frames(reverse=True)
 
 
 def _encode_mask(mask: np.ndarray) -> RLEMaskDTO:

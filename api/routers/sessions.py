@@ -116,7 +116,14 @@ async def _stream_propagation(
             break
 
         if isinstance(item, BaseException):
-            logger.error("Propagation error in session %s: %s", record.session_id, item)
+            logger.exception("Propagation error in session %s", record.session_id, exc_info=item)
+            error_payload = {
+                "error": {
+                    "type": item.__class__.__name__,
+                    "message": str(item),
+                }
+            }
+            yield (json.dumps(error_payload) + "\n").encode()
             break
 
         yield (json.dumps(item.model_dump()) + "\n").encode()

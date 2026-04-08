@@ -213,6 +213,10 @@ canvas {
           <label>Object ID</label>
           <input type="number" id="object-id" value="1" min="1" step="1">
         </div>
+        <div class="field" style="max-width:110px;">
+          <label>Frame #</label>
+          <input type="number" id="prompt-frame" value="0" min="0" step="1">
+        </div>
         <div class="field">
           <label>Direction</label>
           <select id="direction" style="width:100%;background:#0f0f0f;border:1px solid #2a2a2a;border-radius:4px;padding:5px 8px;color:#e0e0e0;font-size:12px;">
@@ -272,7 +276,7 @@ canvas {
 </div>
 
 <script>
-const API = 'http://localhost:8000';
+const API = 'http://10.64.11.250:8000';
 const UPLOAD_CHUNK_SIZE = 1024 * 1024;
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -282,6 +286,7 @@ const s = {
   uploadStartSec: 0, uploadDurationSec: null,
   localVideoUrl: null,
   posterImg: null,
+  previewVideo: null,
   box: null,           // [x1, y1, x2, y2] video coords
   frames: [],          // collected TrackingFrameDTO
   propagating: false,
@@ -395,9 +400,11 @@ $('upload-btn').onclick = async () => {
     s.durationSec = video.duration_sec ?? 0;
     s.uploadStartSec = startSec;
     s.uploadDurationSec = dur > 0 ? dur : null;
+    $('prompt-frame').max = String(Math.max(0, s.totalFrames - 1));
+    $('prompt-frame').value = '0';
     log(`Uploaded — ${video.width}×${video.height}, ${video.frame_count} frames`, 'ok');
 
-    await loadPoster(`${API}${video.poster_url}`);
+    await refreshPromptFramePreview();
     $('prompt-card').classList.remove('hidden');
     $('session-card').classList.remove('hidden');
     $('reset-btn').classList.remove('hidden');
@@ -414,26 +421,129 @@ $('upload-btn').onclick = async () => {
   }
 };
 
-// ── Load poster ────────────────────────────────────────────────────────────
-function loadPoster(url) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.src = url;
-    img.onload = () => {
-      s.posterImg = img;
-      const maxW = $('canvas-wrap').clientWidth || 800;
-      const scale = Math.min(1, maxW / img.width);
-      canvas.width  = Math.round(img.width  * scale);
-      canvas.height = Math.round(img.height * scale);
-      $('canvas-placeholder').classList.add('hidden');
-      canvas.classList.remove('hidden');
-      $('canvas-title').textContent = `Preview — drag to draw bounding box`;
-      redraw();
-      resolve();
-    };
-    img.onerror = reject;
+// ── Load prompt-frame preview ──────────────────────────────────────────────
+async function ensurePreviewVideo() {
+  const sourceUrl = s.localVideoUrl ?? `${API}/videos/${s.videoId}/stream`;
+  if (s.previewVideo && s.previewVideo.src === sourceUrl) return s.previewVideo;
+
+  const vid = document.createElement('video');
+  vid.src = sourceUrl;
+  vid.crossOrigin = 'anonymous';
+  vid.muted = true;
+  vid.preload = 'auto';
+  vid.playsInline = true;
+
+  await new Promise((resolve, reject) => {
+    vid.onloadedmetadata = resolve;
+    vid.onerror = reject;
+    vid.load();
   });
+
+  s.previewVideo = vid;
+  return vid;
+}
+
+async function loadPreviewFrame(frameIndex) {
+  const vid = await ensurePreviewVideo();
+  const fps = s.durationSec > 0 && s.totalFrames > 0 ? s.totalFrames / s.durationSec : 30;
+  const clipStartSec = s.localVideoUrl ? s.uploadStartSec : 0;
+  const targetTime = clipStartSec + (frameIndex / Math.max(fps, 0.001));
+
+  if (Math.abs(vid.currentTime - targetTime) > 1e-3 || vid.readyState < 2) {
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      vid.removeEventListener('seeked', onSeeked);
+      vid.removeEventListener('error', onError);
+    };
+    const onSeeked = () => { cleanup(); resolve(); };
+    const onError = () => { cleanup(); reject(new Error('Failed to seek preview frame')); };
+    vid.addEventListener('seeked', onSeeked, { once: true });
+    vid.addEventListener('error', onError, { once: true });
+    vid.currentTime = targetTime;
+  });
+  }
+
+  const frameCanvas = document.createElement('canvas');
+  frameCanvas.width = s.videoW || vid.videoWidth;
+  frameCanvas.height = s.videoH || vid.videoHeight;
+  frameCanvas.getContext('2d').drawImage(vid, 0, 0, frameCanvas.width, frameCanvas.height);
+
+  s.posterImg = frameCanvas;
+  const maxW = $('canvas-wrap').clientWidth || 800;
+  const scale = Math.min(1, maxW / frameCanvas.width);
+  canvas.width = Math.round(frameCanvas.width * scale);
+  canvas.height = Math.round(frameCanvas.height * scale);
+  $('canvas-placeholder').classList.add('hidden');
+  canvas.classList.remove('hidden');
+  $('canvas-title').textContent = `Preview — frame ${frameIndex}`;
+  redraw();
+}
+
+function clearPromptBox() {
+  s.box = null;
+  draw.active = false;
+  $('box-coords').classList.add('hidden');
+  $('track-btn').disabled = true;
+  redraw();
+}
+
+async function refreshPromptFramePreview() {
+  if (!s.videoId) return;
+  const promptFrameIndex = getPromptFrameIndex();
+  clearPromptBox();
+  await loadPreviewFrame(promptFrameIndex);
+}
+
+async function streamPropagation(passDirection, promptFrameIndex, onFrame) {
+  const propRes = await fetch(`${API}/sessions/${s.sessionId}/propagate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      start_frame_index: promptFrameIndex,
+      direction: passDirection,
+      max_frames: null,
+      close_on_complete: false,
+    }),
+  });
+  if (!propRes.ok) throw new Error(await propRes.text());
+  if (!propRes.body) throw new Error('Empty propagation response body');
+
+  const reader = propRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let frame;
+      try { frame = JSON.parse(line); } catch { continue; }
+      if (frame.error) {
+        throw new Error(`${frame.error.type}: ${frame.error.message}`);
+      }
+      onFrame(frame);
+    }
+  }
+
+  const tail = buf.trim();
+  if (!tail) return;
+  const frame = JSON.parse(tail);
+  if (frame.error) {
+    throw new Error(`${frame.error.type}: ${frame.error.message}`);
+  }
+  onFrame(frame);
+}
+
+async function closeSessionIfNeeded() {
+  if (!s.sessionId) return;
+  const sessionId = s.sessionId;
+  s.sessionId = null;
+  await fetch(`${API}/sessions/${sessionId}`, { method: 'DELETE' }).catch(() => {});
 }
 
 // ── Create session ─────────────────────────────────────────────────────────
@@ -452,6 +562,8 @@ async function createSession() {
     const data = await res.json();
     s.sessionId = data.session_id;
     s.totalFrames = data.num_frames;
+    $('prompt-frame').max = String(Math.max(0, s.totalFrames - 1));
+    getPromptFrameIndex();
 
     setSession('green', `Session ready`);
     $('session-meta').textContent = `${s.videoW}×${s.videoH} · ${data.num_frames} frames · ${data.session_id.slice(0,8)}…`;
@@ -631,16 +743,25 @@ function redraw() {
 }
 
 // ── Clear box ──────────────────────────────────────────────────────────────
-$('clear-btn').onclick = () => {
-  s.box = null; draw.active = false;
-  $('box-coords').classList.add('hidden');
-  $('track-btn').disabled = true;
-  redraw();
-};
+$('clear-btn').onclick = () => clearPromptBox();
+
+$('prompt-frame').addEventListener('change', async () => {
+  try {
+    await refreshPromptFramePreview();
+    log(`Preview moved to frame ${$('prompt-frame').value}`, 'muted');
+  } catch (e) {
+    log(`Failed to load frame preview: ${e.message}`, 'err');
+  }
+});
 
 // ── Track ──────────────────────────────────────────────────────────────────
 $('track-btn').onclick = async () => {
   if (!s.box || !s.videoId) return;
+  const promptFrameIndex = getPromptFrameIndex();
+  const requestedDirection = $('direction').value;
+  const propagationPasses = requestedDirection === 'both'
+    ? ['forward', 'backward']
+    : [requestedDirection];
   s.propagating = true;
   s.frames = [];
   setBtn('track-btn', 'Tracking…', true);
@@ -654,9 +775,9 @@ $('track-btn').onclick = async () => {
   try {
     if (!s.sessionId) await createSession();
 
-    // Add box prompt on frame 0
-    log('Adding box prompt…', 'info');
-    const pRes = await fetch(`${API}/sessions/${s.sessionId}/frames/0/box`, {
+    // Add box prompt on the selected frame
+    log(`Adding box prompt on frame ${promptFrameIndex}…`, 'info');
+    const pRes = await fetch(`${API}/sessions/${s.sessionId}/frames/${promptFrameIndex}/box`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ object_id: parseInt($('object-id').value) || 1, box: s.box }),
@@ -664,58 +785,38 @@ $('track-btn').onclick = async () => {
     if (!pRes.ok) throw new Error(await pRes.text());
     log('Prompt added, propagating…', 'info');
 
-    // Propagate
-    const propRes = await fetch(`${API}/sessions/${s.sessionId}/propagate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        start_frame_index: 0,
-        direction: $('direction').value,
-        max_frames: null,
-        close_on_complete: true,
-      }),
-    });
-    if (!propRes.ok) throw new Error(await propRes.text());
-
-    // Stream NDJSON
-    const reader = propRes.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    let frameCount = 0;
+    const frameMap = new Map();
     const objIds = new Set();
+    let frameCount = 0;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let frame;
-        try { frame = JSON.parse(line); } catch { continue; }
-        s.frames.push(frame);
+    for (const passDirection of propagationPasses) {
+      log(`Propagating ${passDirection}…`, 'info');
+      await streamPropagation(passDirection, promptFrameIndex, frame => {
+        frameMap.set(frame.frame_index, frame);
+        s.frames = Array.from(frameMap.values()).sort((a, b) => a.frame_index - b.frame_index);
         frameCount++;
         for (const obj of frame.objects) if (obj.bbox) objIds.add(obj.object_id);
 
-        $('stat-frames').textContent = frameCount;
+        $('stat-frames').textContent = s.frames.length;
         $('stat-objects').textContent = objIds.size;
         if (s.totalFrames > 0) {
-          $('progress-bar').style.width = Math.min(100, frameCount / s.totalFrames * 100) + '%';
+          $('progress-bar').style.width = Math.min(100, s.frames.length / s.totalFrames * 100) + '%';
         }
         if (frameCount % 15 === 0) redraw();
-      }
+      });
     }
+
+    await closeSessionIfNeeded();
 
     $('progress-bar').style.width = '100%';
     redraw();
-    setSession('green', `Done — ${frameCount} frames`);
-    log(`Done: ${frameCount} frames, ${objIds.size} object(s) tracked`, 'ok');
+    setSession('green', `Done — ${s.frames.length} frames`);
+    log(`Done: ${s.frames.length} unique frames, ${objIds.size} object(s) tracked`, 'ok');
     $('render-btn').classList.remove('hidden');
-    s.sessionId = null;
     setSession('', 'Ready to track again');
-    $('session-meta').textContent = `${s.videoW}×${s.videoH} · previous session closed automatically`;
+    $('session-meta').textContent = `${s.videoW}×${s.videoH} · previous session closed after propagation`;
   } catch (e) {
+    await closeSessionIfNeeded();
     setSession('red', 'Tracking failed');
     log(`Tracking failed: ${e.message}`, 'err');
   }
@@ -863,8 +964,10 @@ $('reset-btn').onclick = async () => {
     videoId: null, sessionId: null,
     videoW: 0, videoH: 0, totalFrames: 0, durationSec: 0,
     uploadStartSec: 0, uploadDurationSec: null, localVideoUrl: null,
-    posterImg: null, box: null, frames: [], propagating: false,
+    posterImg: null, previewVideo: null, box: null, frames: [], propagating: false,
   });
+  $('prompt-frame').value = '0';
+  $('prompt-frame').max = '0';
   $('render-btn').classList.add('hidden');
   $('render-status').classList.add('hidden');
   $('upload-progress-wrap').classList.add('hidden');
@@ -895,6 +998,15 @@ function setBtn(id, text, disabled) {
 function setSession(dotClass, text) {
   $('session-dot').className = 'dot ' + dotClass;
   $('session-text').textContent = text;
+}
+
+function getPromptFrameIndex() {
+  const input = $('prompt-frame');
+  const rawValue = Number.parseInt(input.value, 10);
+  const maxFrame = Math.max(0, (s.totalFrames || 1) - 1);
+  const frameIndex = Number.isFinite(rawValue) ? Math.max(0, Math.min(rawValue, maxFrame)) : 0;
+  input.value = String(frameIndex);
+  return frameIndex;
 }
 
 // Redraw canvas on resize
