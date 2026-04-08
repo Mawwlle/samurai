@@ -25,10 +25,10 @@ from api.exceptions import (
     video_processing_error_handler,
     propagation_error_handler,
 )
-from api.ml.loader import build_model_config, load_predictor
+from api.ml.loader import build_model_config, load_image_predictor, load_predictor
 from api.repositories.session_repo import SessionRepository
 from api.repositories.video_repo import VideoRepository
-from api.routers import health, sessions, videos
+from api.routers import health, images, sessions, videos
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,10 +53,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("Loading SAM2 predictor (model_size=%s)…", settings.model_size)
     predictor = load_predictor(model_config)
+    image_predictor = load_image_predictor(model_config)
     logger.info("SAM2 predictor ready on device %s.", predictor.device)
 
     app.state.settings = settings
     app.state.predictor = predictor
+    app.state.image_predictor = image_predictor
     app.state.session_repo = SessionRepository()
     app.state.video_repo = VideoRepository()
 
@@ -97,6 +99,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(PropagationError, propagation_error_handler)  # type: ignore[arg-type]
 
     app.include_router(health.router)
+    app.include_router(images.router)
     app.include_router(videos.router)
     app.include_router(sessions.router)
 

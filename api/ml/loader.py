@@ -1,11 +1,12 @@
-"""SAM2 video predictor loading."""
+"""SAM2 predictor loading for video and image inference."""
 
 import contextlib
 import logging
 from pathlib import Path
 
 import torch
-from sam2.build_sam import build_sam2_video_predictor
+from sam2.build_sam import build_sam2, build_sam2_video_predictor
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 
 from api.config import Settings
@@ -135,6 +136,35 @@ def load_predictor(config: ModelConfig) -> SAM2VideoPredictor:
     )
 
     logger.info("SAM2 predictor loaded successfully.")
+    return predictor
+
+
+def load_image_predictor(config: ModelConfig) -> SAM2ImagePredictor:
+    """Load the SAM2 image predictor from checkpoint."""
+    checkpoint: Path = config.checkpoint_path
+    if not checkpoint.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found at '{checkpoint}'. "
+            "Run the SAM2 download script first."
+        )
+
+    device = resolve_device(config.device)
+    configure_gpu(device)
+
+    logger.info(
+        "Loading SAM2 image predictor: cfg=%s ckpt=%s device=%s",
+        config.model_cfg,
+        checkpoint.name,
+        device,
+    )
+
+    model = build_sam2(
+        config.model_cfg,
+        str(checkpoint),
+        device=device,
+    )
+    predictor = SAM2ImagePredictor(model, mask_threshold=config.score_thresh)
+    logger.info("SAM2 image predictor loaded successfully.")
     return predictor
 
 

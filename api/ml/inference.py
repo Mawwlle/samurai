@@ -1,4 +1,4 @@
-"""Pure inference functions wrapping SAM2VideoPredictor.
+"""Pure inference functions wrapping SAM2 predictors.
 
 All functions are stateless with respect to the predictor — the mutable
 ``inference_state`` is owned by the caller (session repository) and passed
@@ -12,8 +12,10 @@ from typing import TypedDict
 import cv2
 import numpy as np
 import pycocotools.mask as mask_util
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 
+from api.schemas.image import ImageSegmentationObjectDTO
 from api.schemas.tracking import (
     BoundingBoxDTO,
     FramePromptsDTO,
@@ -411,4 +413,48 @@ def _build_object_tracks(
                 polygon=_mask_to_polygon(mask) if has_object else None,
             )
         )
+    return results
+
+
+def segment_image_with_boxes(
+    predictor: SAM2ImagePredictor,
+    image: np.ndarray,
+    prompts: list[tuple[str | None, tuple[float, float, float, float], tuple[float, float] | None]],
+    score_thresh: float,
+) -> list[ImageSegmentationObjectDTO]:
+    """Segment a static image with SAM2 using box prompts."""
+
+    predictor.set_image(image)
+    results: list[ImageSegmentationObjectDTO] = []
+
+    for label, box, point in prompts:
+        point_coords = None
+        point_labels = None
+        if point is not None:
+            point_coords = np.array([[point[0], point[1]]], dtype=np.float32)
+            point_labels = np.array([1], dtype=np.int32)
+        masks, ious, _ = predictor.predict(
+            point_coords=point_coords,
+            point_labels=point_labels,
+            box=np.array(box, dtype=np.float32),
+            multimask_output=False,
+            return_logits=False,
+            normalize_coords=False,
+        )
+        if len(masks) == 0:
+            results.append(ImageSegmentationObjectDTO(label=label, bbox=None, mask=None, polygon=None))
+            continue
+
+        best_index = int(np.argmax(ious)) if len(ious) > 1 else 0
+        mask = masks[best_index] > score_thresh
+        has_object = bool(mask.any())
+        results.append(
+            ImageSegmentationObjectDTO(
+                label=label,
+                bbox=_mask_to_bbox(mask) if has_object else None,
+                mask=_encode_mask(mask) if has_object else None,
+                polygon=_mask_to_polygon(mask) if has_object else None,
+            )
+        )
+
     return results
